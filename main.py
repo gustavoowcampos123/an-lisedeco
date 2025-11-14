@@ -3,209 +3,192 @@ import streamlit as st
 import pandas as pd
 
 
-# --------- Funções auxiliares --------- #
-def init_session_state():
+# ---------------------
+# Inicialização
+# ---------------------
+def init_session():
     if "tabela_base" not in st.session_state:
-        st.session_state["tabela_base"] = None
+        st.session_state.tabela_base = None
+    if "orcamento" not in st.session_state:
+        st.session_state.orcamento = []
     if "base_dict" not in st.session_state:
-        st.session_state["base_dict"] = {}
-    if "orcamento_linhas" not in st.session_state:
-        st.session_state["orcamento_linhas"] = []
-    if "co_gerado" not in st.session_state:
-        st.session_state["co_gerado"] = False
+        st.session_state.base_dict = {}
+    if "co_ok" not in st.session_state:
+        st.session_state.co_ok = False
 
 
-def carregar_tabela_base(uploaded_file):
-    """
-    Lê o Excel e tenta encontrar uma aba com as colunas:
-    Item, un, Quantidade Total, Valor Total.
+# ---------------------
+# Detectar automaticamente o cabeçalho
+# ---------------------
+def detectar_cabecalho(df):
+    colunas_esperadas = ["Item", "un", "Quantidade Total", "Valor Total"]
 
-    A sua planilha tem esses cabeçalhos a partir da linha 6 (header=5),
-    então o código tenta usar esse padrão em todas as abas.
-    """
+    for i in range(10):  # tenta nas 10 primeiras linhas
+        linha = df.iloc[i].astype(str).str.strip()
+        if all(c in linha.values for c in colunas_esperadas):
+            return i
+
+    return None
+
+
+# ---------------------
+# Carregar planilha
+# ---------------------
+def carregar_tabela_base(upload):
     try:
-        xls = pd.ExcelFile(uploaded_file)
-        colunas_esperadas = ["Item", "un", "Quantidade Total", "Valor Total"]
+        xls = pd.ExcelFile(upload)
+        df_raw = pd.read_excel(xls, sheet_name=0, header=None)
 
-        df_encontrado = None
-        aba_encontrada = None
-
-        # tenta em todas as abas do arquivo
-        for sheet in xls.sheet_names:
-            try:
-                # muitas planilhas "modelo AW" têm o cabeçalho na linha 6 -> header=5
-                df_tmp = pd.read_excel(xls, sheet_name=sheet, header=5)
-            except Exception:
-                continue
-
-            if all(col in df_tmp.columns for col in colunas_esperadas):
-                df_encontrado = df_tmp
-                aba_encontrada = sheet
-                break
-
-        if df_encontrado is None:
-            st.error(
-                "Não encontrei nenhuma aba com as colunas "
-                "**Item**, **un**, **Quantidade Total** e **Valor Total**.\n\n"
-                "Confirme se a planilha segue esse modelo."
-            )
+        linha_header = detectar_cabecalho(df_raw)
+        if linha_header is None:
+            st.error("Não encontrei cabeçalho com as colunas: Item, un, Quantidade Total, Valor Total")
             return None
 
-        df = df_encontrado.copy()
+        df = pd.read_excel(xls, sheet_name=0, header=linha_header)
 
-        # Mantém apenas as colunas importantes + demais (se quiser olhar depois)
-        # Aqui garantimos que as colunas esperadas existem
-        # e filtramos somente as linhas válidas
-        df = df[
-            (df["Item"].notna())
-            & (df["Quantidade Total"].notna())
-            & (df["Valor Total"].notna())
-        ]
+        # Filtra apenas itens válidos
+        df = df[["Item", "un", "Quantidade Total", "Valor Total"]].dropna()
 
-        # Evita divisão por zero
         df["Quantidade Total"] = df["Quantidade Total"].replace(0, pd.NA)
-
-        # Calcula valor unitário a partir de Valor Total / Quantidade Total
         df["valor_unitario"] = df["Valor Total"] / df["Quantidade Total"]
-
-        # Remove linhas sem valor_unitario válido
         df = df.dropna(subset=["valor_unitario"])
-
-        # Feedback da aba utilizada
-        st.sidebar.success(f"Tabela base carregada da aba: **{aba_encontrada}**")
 
         return df
 
     except Exception as e:
-        st.error(f"Erro ao ler o arquivo Excel: {e}")
+        st.error(f"Erro ao carregar planilha: {e}")
         return None
 
 
+# ---------------------
+# Criar dicionário de preços
+# ---------------------
 def montar_base_dict(df):
     base = {}
-    for _, row in df.iterrows():
-        item = row["Item"]
-        base[item] = {
-            "un": row["un"],
-            "valor_unitario": float(row["valor_unitario"]),
+    for _, r in df.iterrows():
+        base[r["Item"]] = {
+            "un": r["un"],
+            "valor_unitario": float(r["valor_unitario"])
         }
     return base
 
 
-def inicializar_orcamento():
-    st.session_state["orcamento_linhas"] = []
-    st.session_state["co_gerado"] = True
-
-
-def adicionar_linha():
-    st.session_state["orcamento_linhas"].append(
-        {
-            "item": None,
-            "un": "",
-            "valor_unitario": 0.0,
-            "quantidade": 0.0,
-            "total_linha": 0.0,
-        }
-    )
-
-
-def gerar_dataframe_orcamento():
-    if not st.session_state["orcamento_linhas"]:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(st.session_state["orcamento_linhas"])
-    total_geral = df["total_linha"].sum()
-
-    # Linha de total geral
-    total_row = {
-        "item": "TOTAL GERAL",
-        "un": "",
-        "valor_unitario": "",
-        "quantidade": "",
-        "total_linha": total_geral,
-    }
-    df_total = pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
-    return df_total
-
-
-def gerar_excel_download(df):
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Orcamento_CO")
-    buffer.seek(0)
-    return buffer
-
-
-# --------- Interface Streamlit --------- #
+# ---------------------
+# Aplicativo
+# ---------------------
 def main():
-    st.set_page_config(
-        page_title="Montagem de Orçamento (CO)",
-        layout="wide",
-    )
+    st.set_page_config(page_title="Gerador de CO")
+    init_session()
 
-    init_session_state()
+    st.title("Gerador de CO — Base AW/Spark")
+    st.write("Carregue sua planilha AW e gere um novo orçamento.")
 
-    st.title("Montagem de Orçamento (CO)")
-    st.markdown(
-        "Aplicação para gerar orçamento a partir de uma planilha base em Excel "
-        "com as colunas **Item**, **un**, **Quantidade Total** e **Valor Total**."
-    )
+    # Upload
+    upload = st.file_uploader("Carregar planilha base (.xlsx)", type=["xlsx"])
 
-    # --------- Sidebar: Tabela base --------- #
-    st.sidebar.header("Configuração da Tabela Base")
-
-    uploaded_file = st.sidebar.file_uploader(
-        "Carregue a planilha base (.xlsx)",
-        type=["xlsx"],
-        help=(
-            "A planilha deve conter as colunas: "
-            "Item, un, Quantidade Total, Valor Total (como na Planilha Spark)."
-        ),
-    )
-
-    if uploaded_file is not None:
-        df_base = carregar_tabela_base(uploaded_file)
-        if df_base is not None:
-            st.session_state["tabela_base"] = df_base
-            st.session_state["base_dict"] = montar_base_dict(df_base)
-    else:
-        st.sidebar.info("Nenhuma planilha carregada ainda.")
-
-    # Preview da tabela base
-    if st.session_state["tabela_base"] is not None:
-        with st.expander("Ver tabela base carregada"):
-            st.dataframe(st.session_state["tabela_base"][["Item", "un", "Quantidade Total", "Valor Total", "valor_unitario"]])
+    if upload:
+        df = carregar_tabela_base(upload)
+        if df is not None:
+            st.session_state.tabela_base = df
+            st.session_state.base_dict = montar_base_dict(df)
+            st.success("Base carregada com sucesso!")
+            st.dataframe(df)
 
     st.markdown("---")
 
-    # --------- Botão GERAR CO --------- #
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        gerar_co_btn = st.button("GERAR CO", type="primary")
-
-    if gerar_co_btn:
-        if st.session_state["tabela_base"] is None:
-            st.error("Por favor, carregue a tabela base em Excel antes de gerar o CO.")
+    # Botão gerar CO
+    if st.button("GERAR CO"):
+        if st.session_state.tabela_base is None:
+            st.error("Carregue a tabela base primeiro.")
         else:
-            inicializar_orcamento()
+            st.session_state.orcamento = []
+            st.session_state.co_ok = True
 
-    # --------- Montagem do Orçamento --------- #
-    if st.session_state["co_gerado"] and st.session_state["tabela_base"] is not None:
-        st.subheader("Montagem do Orçamento (CO)")
+    # Se CO ativo:
+    if st.session_state.co_ok and st.session_state.tabela_base is not None:
 
-        # Botão de adicionar linha
-        if st.button("Adicionar linha"):
-            adicionar_linha()
+        st.subheader("Montagem do Orçamento")
 
-        base_dict = st.session_state["base_dict"]
-        itens_disponiveis = list(base_dict.keys())
+        if st.button("Adicionar Linha"):
+            st.session_state.orcamento.append(
+                {"item": None, "un": "", "vu": 0.0, "qt": 0.0, "total": 0.0}
+            )
 
-        linhas_atualizadas = []
-        total_geral = 0.0
+        base = st.session_state.base_dict
 
-        # Renderizar cada linha do orçamento
-        for idx, linha in enumerate(st.session_state["orcamento_linhas"]):
-            st.markdown(f"**Linha {idx + 1}**")
-            col_item, col_un, col_vu, col_qt, col_total = st.columns([3, 1, 2, 2, 2])
+        novas_linhas = []
+        total_geral = 0
 
-            # Sel
+        for idx, linha in enumerate(st.session_state.orcamento):
+            st.markdown(f"### Linha {idx+1}")
+
+            col1, col2, col3, col4, col5 = st.columns([3, 1, 2, 2, 2])
+
+            with col1:
+                item = st.selectbox(
+                    "Item:",
+                    options=[""] + list(base.keys()),
+                    index=0,
+                    key=f"item_{idx}"
+                )
+
+            if item:
+                un = base[item]["un"]
+                vu = base[item]["valor_unitario"]
+            else:
+                un = ""
+                vu = 0.0
+
+            with col2:
+                st.write("un")
+                st.text_input("", value=un, disabled=True, key=f"un_{idx}")
+
+            with col3:
+                st.write("V. Unitário")
+                st.text_input("", value=f"{vu:.2f}", disabled=True, key=f"vu_{idx}")
+
+            with col4:
+                qt = st.number_input(
+                    "Qtd",
+                    min_value=0.0,
+                    step=1.0,
+                    key=f"qt_{idx}"
+                )
+
+            total = qt * vu
+            total_geral += total
+
+            with col5:
+                st.write("Total")
+                st.text_input("", value=f"{total:.2f}", disabled=True, key=f"total_{idx}")
+
+            novas_linhas.append({
+                "item": item,
+                "un": un,
+                "vu": vu,
+                "qt": qt,
+                "total": total
+            })
+
+            st.markdown("---")
+
+        st.session_state.orcamento = novas_linhas
+
+        st.subheader(f"Total Geral: R$ {total_geral:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+        # Download
+        df_final = pd.DataFrame(novas_linhas)
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as w:
+            df_final.to_excel(w, index=False)
+        buffer.seek(0)
+
+        st.download_button(
+            "Baixar Orçamento",
+            data=buffer,
+            file_name="orcamento.xlsx"
+        )
+
+
+if __name__ == "__main__":
+    main()
