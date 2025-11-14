@@ -16,21 +16,63 @@ def init_session_state():
 
 
 def carregar_tabela_base(uploaded_file):
-    try:
-        df = pd.read_excel(uploaded_file)
+    """
+    Lê o Excel e tenta encontrar uma aba com as colunas:
+    Item, un, Quantidade Total, Valor Total.
 
+    A sua planilha tem esses cabeçalhos a partir da linha 6 (header=5),
+    então o código tenta usar esse padrão em todas as abas.
+    """
+    try:
+        xls = pd.ExcelFile(uploaded_file)
         colunas_esperadas = ["Item", "un", "Quantidade Total", "Valor Total"]
-        for col in colunas_esperadas:
-            if col not in df.columns:
-                st.error(f"Coluna obrigatória ausente na planilha: **{col}**")
-                return None
+
+        df_encontrado = None
+        aba_encontrada = None
+
+        # tenta em todas as abas do arquivo
+        for sheet in xls.sheet_names:
+            try:
+                # muitas planilhas "modelo AW" têm o cabeçalho na linha 6 -> header=5
+                df_tmp = pd.read_excel(xls, sheet_name=sheet, header=5)
+            except Exception:
+                continue
+
+            if all(col in df_tmp.columns for col in colunas_esperadas):
+                df_encontrado = df_tmp
+                aba_encontrada = sheet
+                break
+
+        if df_encontrado is None:
+            st.error(
+                "Não encontrei nenhuma aba com as colunas "
+                "**Item**, **un**, **Quantidade Total** e **Valor Total**.\n\n"
+                "Confirme se a planilha segue esse modelo."
+            )
+            return None
+
+        df = df_encontrado.copy()
+
+        # Mantém apenas as colunas importantes + demais (se quiser olhar depois)
+        # Aqui garantimos que as colunas esperadas existem
+        # e filtramos somente as linhas válidas
+        df = df[
+            (df["Item"].notna())
+            & (df["Quantidade Total"].notna())
+            & (df["Valor Total"].notna())
+        ]
 
         # Evita divisão por zero
         df["Quantidade Total"] = df["Quantidade Total"].replace(0, pd.NA)
+
+        # Calcula valor unitário a partir de Valor Total / Quantidade Total
         df["valor_unitario"] = df["Valor Total"] / df["Quantidade Total"]
 
         # Remove linhas sem valor_unitario válido
         df = df.dropna(subset=["valor_unitario"])
+
+        # Feedback da aba utilizada
+        st.sidebar.success(f"Tabela base carregada da aba: **{aba_encontrada}**")
 
         return df
 
@@ -115,7 +157,10 @@ def main():
     uploaded_file = st.sidebar.file_uploader(
         "Carregue a planilha base (.xlsx)",
         type=["xlsx"],
-        help="A planilha deve conter as colunas: Item, un, Quantidade Total, Valor Total.",
+        help=(
+            "A planilha deve conter as colunas: "
+            "Item, un, Quantidade Total, Valor Total (como na Planilha Spark)."
+        ),
     )
 
     if uploaded_file is not None:
@@ -123,14 +168,13 @@ def main():
         if df_base is not None:
             st.session_state["tabela_base"] = df_base
             st.session_state["base_dict"] = montar_base_dict(df_base)
-            st.sidebar.success("Tabela base carregada com sucesso!")
     else:
         st.sidebar.info("Nenhuma planilha carregada ainda.")
 
     # Preview da tabela base
     if st.session_state["tabela_base"] is not None:
         with st.expander("Ver tabela base carregada"):
-            st.dataframe(st.session_state["tabela_base"])
+            st.dataframe(st.session_state["tabela_base"][["Item", "un", "Quantidade Total", "Valor Total", "valor_unitario"]])
 
     st.markdown("---")
 
@@ -164,94 +208,4 @@ def main():
             st.markdown(f"**Linha {idx + 1}**")
             col_item, col_un, col_vu, col_qt, col_total = st.columns([3, 1, 2, 2, 2])
 
-            # Select de item
-            with col_item:
-                item = st.selectbox(
-                    "Item",
-                    options=[""] + itens_disponiveis,
-                    index=itens_disponiveis.index(linha["item"]) + 1
-                    if linha["item"] in itens_disponiveis
-                    else 0,
-                    key=f"item_{idx}",
-                )
-            # Atualiza dados de unidade e valor unitário
-            if item and item in base_dict:
-                un = base_dict[item]["un"]
-                valor_unitario = base_dict[item]["valor_unitario"]
-            else:
-                un = ""
-                valor_unitario = 0.0
-
-            # Unidade (somente leitura)
-            with col_un:
-                st.text_input("un", value=un, disabled=True, key=f"un_{idx}")
-
-            # Valor unitário (somente leitura)
-            with col_vu:
-                st.text_input(
-                    "Valor Unitário",
-                    value=f"{valor_unitario:.2f}",
-                    disabled=True,
-                    key=f"vu_{idx}",
-                )
-
-            # Quantidade
-            with col_qt:
-                quantidade = st.number_input(
-                    "Quantidade",
-                    min_value=0.0,
-                    step=1.0,
-                    value=float(linha["quantidade"]) if linha["quantidade"] else 0.0,
-                    key=f"qt_{idx}",
-                )
-
-            # Total da linha
-            total_linha = valor_unitario * quantidade
-            total_geral += total_linha
-
-            with col_total:
-                st.text_input(
-                    "Total da Linha",
-                    value=f"{total_linha:.2f}",
-                    disabled=True,
-                    key=f"total_{idx}",
-                )
-
-            # Guarda linha atualizada
-            linhas_atualizadas.append(
-                {
-                    "item": item if item else None,
-                    "un": un,
-                    "valor_unitario": valor_unitario,
-                    "quantidade": quantidade,
-                    "total_linha": total_linha,
-                }
-            )
-
-            st.markdown("---")
-
-        # Atualiza no session_state
-        st.session_state["orcamento_linhas"] = linhas_atualizadas
-
-        # Resumo do orçamento
-        st.subheader("Resumo do Orçamento")
-        st.markdown(f"**Total Geral do Orçamento: R$ {total_geral:,.2f}**".replace(",", "X").replace(".", ",").replace("X", "."))
-
-        df_orcamento = gerar_dataframe_orcamento()
-        if not df_orcamento.empty:
-            st.dataframe(df_orcamento)
-
-            excel_bytes = gerar_excel_download(df_orcamento)
-            st.download_button(
-                label="Baixar Orçamento em Excel",
-                data=excel_bytes,
-                file_name="orcamento_CO.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-    else:
-        st.info("Carregue a tabela base e clique em **GERAR CO** para iniciar o orçamento.")
-
-
-if __name__ == "__main__":
-    main()
+            # Sel
